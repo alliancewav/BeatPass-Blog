@@ -146,24 +146,52 @@ function downloadYouTube(videoId, withAudio) {
 
 // ── ffmpeg composite ────────────────────────────────────────────────────────
 
-function compositeVideo(videoPath, overlayPath, outputPath, { width, height, duration, withAudio, progressBar, accentColor }) {
+function compositeVideo(videoPath, overlayPath, outputPath, { width, height, duration, withAudio, progressBar, timerInfo, accentColor }) {
   return new Promise((resolve, reject) => {
     // Scale video to fill portrait frame (cover mode) then crop, then overlay transparent PNG
     let filterComplex;
 
+    // Find a monospace font for drawtext (DejaVu Sans Mono is standard on Ubuntu/Debian)
+    const MONO_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf';
+    const fontAvailable = fs.existsSync(MONO_FONT);
+
     if (progressBar && accentColor) {
       // Animated progress bar: color source → scale width with time expression → overlay at track pos
-      // drawbox 't' = thickness (not time!), so we use scale(eval=frame) + overlay(eval=frame) instead
       const { x, y, w, h } = progressBar;
       const ffColor = accentColor.replace('#', '0x');
       const dur = String(duration);
-      filterComplex = [
+
+      const filters = [
         `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1[vid]`,
         `[vid][1:v]overlay=0:0[comp]`,
         `color=c=${ffColor}:s=${w}x${h}:d=${dur}:r=30[barsrc]`,
-        `[barsrc]scale=w='max(2\\,trunc(${w}*t/${dur}/2)*2)':h=${h}:eval=frame:flags=fast_bilinear[bar]`,
-        `[comp][bar]overlay=${x}:${y}:eval=frame:shortest=1[out]`,
-      ].join(';');
+        `[barsrc]scale=w='max(2\,trunc(${w}*t/${dur}/2)*2)':h=${h}:eval=frame:flags=fast_bilinear[bar]`,
+        `[comp][bar]overlay=${x}:${y}:eval=frame:shortest=1[barout]`,
+      ];
+
+      // Animated elapsed timer via drawtext (requires monospace font)
+      if (timerInfo && fontAvailable) {
+        const tc = timerInfo.color || '#FFFFFF';
+        // Parse CSS rgb(r,g,b) or hex color to ffmpeg format
+        let ffTimerColor = 'white';
+        const rgbMatch = tc.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+        if (rgbMatch) {
+          ffTimerColor = `0x${Number(rgbMatch[1]).toString(16).padStart(2,'0')}${Number(rgbMatch[2]).toString(16).padStart(2,'0')}${Number(rgbMatch[3]).toString(16).padStart(2,'0')}`;
+        } else if (tc.startsWith('#')) {
+          ffTimerColor = tc.replace('#', '0x');
+        }
+        const timerOpacity = timerInfo.opacity != null ? timerInfo.opacity : 0.5;
+        // ffmpeg drawtext expression for m:ss elapsed time
+        // Within single-quoted text value, \: escapes colons from filter separator parsing
+        const timeExpr = `%{eif\\:floor(t/60)\\:d}\\:%{eif\\:mod(floor(t)\\,60)\\:d\\:2}`;
+        filters.push(
+          `[barout]drawtext=fontfile='${MONO_FONT}':text='${timeExpr}':fontsize=${timerInfo.fontSize || 27}:fontcolor=${ffTimerColor}@${timerOpacity}:x=${timerInfo.x || 0}:y=${timerInfo.y || 0}[out]`
+        );
+      } else {
+        filters.push(`[barout]null[out]`);
+      }
+
+      filterComplex = filters.join(';');
     } else {
       filterComplex = [
         `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1[vid]`,
@@ -187,7 +215,7 @@ function compositeVideo(videoPath, overlayPath, outputPath, { width, height, dur
       outputPath,
     ];
 
-    log(`  ffmpeg: compositing → ${path.basename(outputPath)}${progressBar ? ` (animated bar at ${progressBar.x},${progressBar.y} ${progressBar.w}x${progressBar.h})` : ''}`);
+    log(`  ffmpeg: compositing → ${path.basename(outputPath)}${progressBar ? ` (animated bar at ${progressBar.x},${progressBar.y} ${progressBar.w}x${progressBar.h})` : ''}${timerInfo ? ` (timer at ${timerInfo.x},${timerInfo.y})` : ''}`);
     const proc = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stderr = '';
@@ -231,7 +259,7 @@ async function processJob(job) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     job.status = 'compositing';
     job.progress = 0.65;
-    await compositeVideo(videoPath, overlayPath, outputPath, { width, height, duration, withAudio, progressBar, accentColor });
+    await compositeVideo(videoPath, overlayPath, outputPath, { width, height, duration, withAudio, progressBar, timerInfo, accentColor });
     job.progress = 0.95;
 
     // 4. Done — set URL
@@ -356,7 +384,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/export') {
     try {
       const body = await parseBody(req);
-      const { videoId, overlayPng, duration = 10, withAudio = false, width = 1080, height = 1350, progressBar, accentColor } = body;
+      const { videoId, overlayPng, duration = 10, withAudio = false, width = 1080, height = 1350, progressBar, timerInfo, accentColor } = body;
 
       if (!videoId || typeof videoId !== 'string' || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
         return sendJSON(res, 400, { error: 'Invalid videoId' });
@@ -381,6 +409,15 @@ const server = http.createServer(async (req, res) => {
           h: Math.round(Number(progressBar.h) || 0),
         };
         opts.accentColor = String(accentColor);
+      }
+      if (timerInfo && typeof timerInfo === 'object') {
+        opts.timerInfo = {
+          x: Math.round(Number(timerInfo.x) || 0),
+          y: Math.round(Number(timerInfo.y) || 0),
+          fontSize: Math.round(Number(timerInfo.fontSize) || 27),
+          color: String(timerInfo.color || '#FFFFFF'),
+          opacity: Number(timerInfo.opacity) || 0.5,
+        };
       }
 
       const job = createJob(videoId, opts);
