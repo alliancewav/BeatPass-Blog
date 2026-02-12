@@ -1,0 +1,15 @@
+[Unit]
+Description=BeatPass Video Export API
+After=network.target
+
+[Service]
+Type=simple
+User=beatpass-blog-ssh
+WorkingDirectory=/home/beatpass-blog-ssh/htdocs/blog.beatpass.ca/scripts
+ExecStart=/usr/bin/node video-api.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

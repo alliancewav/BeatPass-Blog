@@ -1,0 +1,27 @@
+User-agent: *
+Allow: /
+
+# Disallow admin/private areas
+Disallow: /admin/
+Disallow: /wp-admin/
+Disallow: /ghost/
+Disallow: /*?preview=*
+
+# Allow assets
+Allow: /assets/
+Allow: /content/
+Allow: /*.css
+Allow: /*.js
+Allow: /*.jpg
+Allow: /*.png
+Allow: /*.svg
+Allow: /*.webp
+
+# Crawl delay
+Crawl-delay: 1
+
+# Sitemap location
+Sitemap: https://blog.beatpass.ca/sitemap.xml
+
+# Host directive (subdomain of beatpass.ca)
+Host: https://blog.beatpass.ca

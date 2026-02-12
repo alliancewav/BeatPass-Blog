@@ -1,0 +1,64 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Ghost CMS — blog.beatpass.ca
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Credentials & Environment ────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+config.production.json
+config.development.json
+.ghost-cli
+
+# ── Ghost Core (installed, not custom code) ──────────────────────────────────
+versions/
+current
+
+# ── Ghost Content (runtime data, uploads, DB) ───────────────────────────────
+content/data/
+content/images/
+content/media/
+content/files/
+content/logs/
+content/settings/
+content/public/
+content/apps/
+content/themes/
+content/blog-drafts/
+
+# ── Docs (raw content, credentials, internal notes) ─────────────────────────
+docs/
+
+# ── Content Designer (separate repo: BeatPass-ContentDesigner) ──────────────
+content-designer/
+content-generator/
+
+# ── Node / Dependencies ─────────────────────────────────────────────────────
+node_modules/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+*.log.*
+
+# ── Scripts runtime artifacts ────────────────────────────────────────────────
+scripts/video-cache/
+scripts/video-tmp/
+scripts/bin/
+scripts/*.pid
+scripts/youtube-sync-state.json
+
+# ── Build output ─────────────────────────────────────────────────────────────
+dist/
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── SSL / ACME ───────────────────────────────────────────────────────────────
+.well-known/
