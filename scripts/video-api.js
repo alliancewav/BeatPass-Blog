@@ -237,7 +237,7 @@ function compositeVideo(videoPath, overlayPath, outputPath, { width, height, dur
 
 async function processJob(job) {
   const { videoId, opts } = job;
-  const { overlayPng, duration, withAudio, width, height, progressBar, accentColor } = opts;
+  const { overlayPng, duration, withAudio, width, height, progressBar, timerInfo, accentColor } = opts;
   const overlayPath = path.join(TEMP_DIR, `${job.id}_overlay.png`);
   const outputPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
 
@@ -378,6 +378,140 @@ const server = http.createServer(async (req, res) => {
       url: job.url,
       error: job.error,
     });
+  }
+
+  // GET /image-proxy?url=... — fetch external images server-side to bypass CORS
+  if (req.method === 'GET' && url.pathname === '/image-proxy') {
+    const targetUrl = url.searchParams.get('url');
+    if (!targetUrl) return sendJSON(res, 400, { error: 'Missing ?url= parameter' });
+
+    try {
+      const parsed = new URL(targetUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return sendJSON(res, 400, { error: 'Only http/https URLs allowed' });
+      }
+
+      const proto = parsed.protocol === 'https:' ? require('https') : http;
+      proto.get(targetUrl, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (upstream) => {
+        if (upstream.statusCode >= 300 && upstream.statusCode < 400 && upstream.headers.location) {
+          // Follow one redirect
+          const rProto = upstream.headers.location.startsWith('https') ? require('https') : http;
+          rProto.get(upstream.headers.location, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (r2) => {
+            const ct = r2.headers['content-type'] || 'application/octet-stream';
+            res.writeHead(r2.statusCode, { 'Content-Type': ct, 'Cache-Control': 'public, max-age=3600' });
+            r2.pipe(res);
+          }).on('error', () => sendJSON(res, 502, { error: 'Redirect fetch failed' }));
+          return;
+        }
+        const ct = upstream.headers['content-type'] || 'application/octet-stream';
+        res.writeHead(upstream.statusCode, { 'Content-Type': ct, 'Cache-Control': 'public, max-age=3600' });
+        upstream.pipe(res);
+      }).on('error', (err) => {
+        sendJSON(res, 502, { error: `Upstream fetch failed: ${err.message}` });
+      });
+    } catch (err) {
+      return sendJSON(res, 400, { error: `Invalid URL: ${err.message}` });
+    }
+    return;
+  }
+
+  // POST /gif-export — convert GIF URL + overlay PNG → MP4 (preserves GIF animation)
+  if (req.method === 'POST' && url.pathname === '/gif-export') {
+    try {
+      const body = await parseBody(req);
+      const { gifUrl, overlayPng, width = 1080, height = 1350, duration = 10 } = body;
+
+      if (!gifUrl || typeof gifUrl !== 'string') {
+        return sendJSON(res, 400, { error: 'Missing gifUrl' });
+      }
+      if (!overlayPng || !overlayPng.startsWith('data:image/png;base64,')) {
+        return sendJSON(res, 400, { error: 'Invalid overlayPng (must be PNG data URL)' });
+      }
+
+      const jobId = crypto.randomBytes(8).toString('hex');
+      const gifPath = path.join(TEMP_DIR, `${jobId}_gif.gif`);
+      const overlayPath = path.join(TEMP_DIR, `${jobId}_overlay.png`);
+      const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+
+      // Save overlay PNG
+      const base64Match = overlayPng.match(/^data:image\/png;base64,(.+)$/);
+      if (!base64Match) return sendJSON(res, 400, { error: 'Invalid overlay data' });
+      fs.writeFileSync(overlayPath, Buffer.from(base64Match[1], 'base64'));
+
+      // Download GIF
+      log(`GIF export ${jobId}: downloading ${gifUrl}`);
+      const downloadGif = (downloadUrl, redirectCount = 0) => new Promise((resolve, reject) => {
+        if (redirectCount > 3) return reject(new Error('Too many redirects'));
+        const proto = downloadUrl.startsWith('https') ? require('https') : http;
+        proto.get(downloadUrl, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (resp) => {
+          if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+            return downloadGif(resp.headers.location, redirectCount + 1).then(resolve, reject);
+          }
+          if (resp.statusCode !== 200) return reject(new Error(`HTTP ${resp.statusCode}`));
+          const ws = fs.createWriteStream(gifPath);
+          resp.pipe(ws);
+          ws.on('finish', () => resolve());
+          ws.on('error', reject);
+        }).on('error', reject);
+      });
+
+      await downloadGif(gifUrl);
+      log(`GIF export ${jobId}: GIF downloaded (${(fs.statSync(gifPath).size / 1024).toFixed(0)} KB)`);
+
+      // ffmpeg: GIF → scale/pad to target size → loop to fill duration → overlay text PNG → MP4
+      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+      const w = Number(width) || 1080;
+      const h = Number(height) || 1350;
+      const dur = Math.min(Number(duration) || 10, 30);
+
+      await new Promise((resolve, reject) => {
+        const args = [
+          '-y',
+          '-ignore_loop', '0',         // loop the GIF indefinitely as input
+          '-i', gifPath,
+          '-i', overlayPath,
+          '-filter_complex', [
+            `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1[gif]`,
+            `[gif][1:v]overlay=0:0:shortest=0[out]`,
+          ].join(';'),
+          '-map', '[out]',
+          '-an',
+          '-c:v', 'libx264',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-t', String(dur),
+          '-movflags', '+faststart',
+          '-pix_fmt', 'yuv420p',
+          '-r', '24',
+          outputPath,
+        ];
+
+        log(`GIF export ${jobId}: ffmpeg compositing...`);
+        const proc = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        proc.stderr.on('data', d => { stderr += d.toString(); });
+        proc.on('close', code => {
+          if (code === 0) {
+            log(`GIF export ${jobId}: done → ${path.basename(outputPath)}`);
+            resolve();
+          } else {
+            log(`GIF export ${jobId}: ffmpeg error (code ${code}):\n${stderr.slice(-500)}`);
+            reject(new Error(`ffmpeg exited with code ${code}`));
+          }
+        });
+        proc.on('error', reject);
+      });
+
+      // Cleanup temp files
+      fs.unlink(gifPath, () => {});
+      fs.unlink(overlayPath, () => {});
+
+      const relUrl = `/assets/content-designer/videos/${jobId}.mp4`;
+      return sendJSON(res, 200, { url: relUrl });
+    } catch (err) {
+      log(`GIF export failed: ${err.message}`);
+      return sendJSON(res, 500, { error: err.message });
+    }
   }
 
   // POST /export
