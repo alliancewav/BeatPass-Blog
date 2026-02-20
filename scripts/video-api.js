@@ -29,7 +29,11 @@ const OUTPUT_DIR = path.join(BASE_DIR, 'content', 'themes', 'aspect', 'assets', 
 const TEMP_DIR = path.join(__dirname, 'video-tmp');
 const MAX_CACHED_RAW = 5;
 const MAX_OUTPUT_AGE_MS = 10 * 60 * 1000; // 10 minutes
-const MAX_TEMP_AGE_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_PODCAST_OUTPUT_AGE_MS = 15 * 60 * 1000; // 15 minutes (auto-deleted after download anyway)
+const MAX_TEMP_AGE_MS = 30 * 60 * 1000; // 30 minutes (podcast renders can take 10+ min)
+const ABANDON_TIMEOUT_MS = 2 * 60 * 1000; // 2 min no poll = abandoned job
+const PODCAST_DOWNLOADED_DELETE_DELAY_MS = 2 * 60 * 1000; // grace period so browser can fetch file
+const MAX_PODCAST_UPLOAD_BYTES = 200 * 1024 * 1024; // 200 MB limit for podcast audio uploads
 const ALLOWED_ORIGINS = [
   'https://blog.beatpass.ca',
   'http://localhost:5173',
@@ -72,7 +76,7 @@ function parseBody(req) {
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
-      if (size > 15 * 1024 * 1024) { // 15 MB limit (overlay PNG can be large)
+      if (size > 30 * 1024 * 1024) { // 30 MB limit (two PNGs for podcast waveform)
         reject(new Error('Body too large'));
         req.destroy();
       }
@@ -279,6 +283,282 @@ async function processJob(job) {
   }
 }
 
+// ── Podcast chunk upload sessions (in-memory tracker) ───────────────────────
+
+const podcastSessions = new Map(); // sessionId → { audioPath, received: Set, totalChunks, ext, createdAt }
+
+function collectRawBody(req, maxBytes = 5 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > maxBytes) { reject(new Error('Chunk too large')); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// ── Podcast video composite ─────────────────────────────────────────────────
+
+function compositePodcast(audioPath, framePath, outputPath, { width, height, duration, progressBar, timerInfo, waveformRegion, accentColor, frameLitPath, onProgress, job }) {
+  return new Promise((resolve, reject) => {
+    const MONO_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf';
+    const fontAvailable = fs.existsSync(MONO_FONT);
+    const dur = String(Math.round(duration));
+    const hasAnimatedProgressBar = progressBar
+      && Number.isFinite(progressBar.x)
+      && Number.isFinite(progressBar.y)
+      && Number.isFinite(progressBar.w)
+      && Number.isFinite(progressBar.h)
+      && progressBar.w > 0
+      && progressBar.h > 0
+      && typeof accentColor === 'string'
+      && accentColor.length > 0;
+
+    // Detect if audio is already AAC/M4A — skip re-encoding
+    const audioExt = path.extname(audioPath).toLowerCase();
+    const canCopyAudio = ['.m4a', '.aac', '.mp4'].includes(audioExt);
+
+    // Build timer color for drawtext
+    let ffTimerColor = 'white';
+    let timerOpacity = 0.35;
+    if (timerInfo && fontAvailable) {
+      const tc = timerInfo.color || 'rgba(255,255,255,0.35)';
+      const rgbaMatch = tc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (rgbaMatch) {
+        ffTimerColor = `0x${Number(rgbaMatch[1]).toString(16).padStart(2,'0')}${Number(rgbaMatch[2]).toString(16).padStart(2,'0')}${Number(rgbaMatch[3]).toString(16).padStart(2,'0')}`;
+      } else if (tc.startsWith('#')) {
+        ffTimerColor = tc.replace('#', '0x');
+      }
+      timerOpacity = timerInfo.opacity != null ? timerInfo.opacity : 0.35;
+    }
+
+    const hasLitFrame = !!frameLitPath;
+    let waveformBlendMode = hasLitFrame ? 'full' : 'none';
+    const args = ['-y'];
+
+    if (hasLitFrame) {
+      // Two-frame approach: blend dim→lit for progressive waveform highlighting
+      // Input 0: dim frame (looped), Input 1: lit frame (looped), Input 2: audio
+      args.push(
+        '-loop', '1', '-framerate', '24', '-i', framePath,
+        '-loop', '1', '-framerate', '24', '-i', frameLitPath,
+        '-i', audioPath,
+      );
+
+      // filter_complex: blend dim→lit based on time, then drawbox + drawtext
+      const filters = [];
+      const frameW = Number(width) || 1920;
+      const frameH = Number(height) || 1080;
+      const hasWaveformRegion = waveformRegion
+        && Number.isFinite(waveformRegion.x)
+        && Number.isFinite(waveformRegion.y)
+        && Number.isFinite(waveformRegion.w)
+        && Number.isFinite(waveformRegion.h)
+        && waveformRegion.w > 0
+        && waveformRegion.h > 0;
+
+      if (hasWaveformRegion) {
+        const wx = Math.max(0, Math.min(frameW - 1, Math.round(Number(waveformRegion.x) || 0)));
+        const wy = Math.max(0, Math.min(frameH - 1, Math.round(Number(waveformRegion.y) || 0)));
+        const ww = Math.max(1, Math.min(frameW - wx, Math.round(Number(waveformRegion.w) || 0)));
+        const wh = Math.max(1, Math.min(frameH - wy, Math.round(Number(waveformRegion.h) || 0)));
+
+        // Faster path: only blend inside waveform strip, then overlay back onto base frame.
+        filters.push('[0:v]split=2[base][dimsrc]');
+        filters.push(`[dimsrc]crop=${ww}:${wh}:${wx}:${wy}[dimcrop]`);
+        filters.push(`[1:v]crop=${ww}:${wh}:${wx}:${wy}[litcrop]`);
+        filters.push(`[dimcrop][litcrop]blend=all_expr='if(lt(X\\,W*T/${dur})\\,B\\,A)'[waveblend]`);
+        filters.push(`[base][waveblend]overlay=${wx}:${wy}[blended]`);
+        waveformBlendMode = 'region';
+      } else {
+        // Fallback: blend entire frame.
+        // Note: T (uppercase) is the timestamp variable in blend expressions.
+        filters.push(`[0:v][1:v]blend=all_expr='if(lt(X\\,W*T/${dur})\\,B\\,A)'[blended]`);
+      }
+
+      let currentLabel = 'blended';
+
+      // Animated progress bar via generated color source + scale + overlay.
+      // NOTE: Avoid drawbox w=...*t... here — drawbox's `t` option is thickness,
+      // which can force the bar to appear fully filled.
+      if (hasAnimatedProgressBar) {
+        const barX = Math.max(0, Math.round(Number(progressBar.x) || 0));
+        const barY = Math.max(0, Math.round(Number(progressBar.y) || 0));
+        const barW = Math.max(1, Math.round(Number(progressBar.w) || 1));
+        const barH = Math.max(1, Math.round(Number(progressBar.h) || 1));
+        const ffColor = accentColor.startsWith('#') ? accentColor.replace('#', '0x') : accentColor;
+        filters.push(`color=c=${ffColor}:s=${barW}x${barH}:d=${dur}:r=24[barsrc]`);
+        filters.push(`[barsrc]scale=w='max(2\\,trunc(${barW}*t/${dur}/2)*2)':h=${barH}:eval=frame:flags=fast_bilinear[bar]`);
+        filters.push(`[${currentLabel}][bar]overlay=${barX}:${barY}:eval=frame:shortest=1[withbar]`);
+        currentLabel = 'withbar';
+      }
+
+      // Animated elapsed timer
+      if (timerInfo && fontAvailable) {
+        const timeExpr = `%{eif\\:floor(t/60)\\:d}\\:%{eif\\:mod(floor(t)\\,60)\\:d\\:2}`;
+        filters.push(`[${currentLabel}]drawtext=fontfile='${MONO_FONT}':text='${timeExpr}':fontsize=${timerInfo.fontSize || 22}:fontcolor=${ffTimerColor}@${timerOpacity}:x=${timerInfo.x || 0}:y=${timerInfo.y || 0}[out]`);
+        currentLabel = 'out';
+      }
+
+      // Slight sharpening improves text readability on fullscreen playback.
+      filters.push(`[${currentLabel}]unsharp=5:5:0.45:3:3:0.0[final]`);
+      currentLabel = 'final';
+
+      args.push('-filter_complex', filters.join(';'));
+      args.push('-map', `[${currentLabel}]`, '-map', '2:a');
+
+    } else {
+      // Single-frame fallback: simple vf chain
+      args.push(
+        '-loop', '1', '-framerate', '24', '-i', framePath,
+        '-i', audioPath,
+      );
+
+      const filters = [];
+      let currentLabel = '0:v';
+
+      if (hasAnimatedProgressBar) {
+        const barX = Math.max(0, Math.round(Number(progressBar.x) || 0));
+        const barY = Math.max(0, Math.round(Number(progressBar.y) || 0));
+        const barW = Math.max(1, Math.round(Number(progressBar.w) || 1));
+        const barH = Math.max(1, Math.round(Number(progressBar.h) || 1));
+        const ffColor = accentColor.startsWith('#') ? accentColor.replace('#', '0x') : accentColor;
+        filters.push(`color=c=${ffColor}:s=${barW}x${barH}:d=${dur}:r=24[barsrc]`);
+        filters.push(`[barsrc]scale=w='max(2\\,trunc(${barW}*t/${dur}/2)*2)':h=${barH}:eval=frame:flags=fast_bilinear[bar]`);
+        filters.push(`[${currentLabel}][bar]overlay=${barX}:${barY}:eval=frame:shortest=1[withbar]`);
+        currentLabel = 'withbar';
+      }
+
+      if (timerInfo && fontAvailable) {
+        const timeExpr = `%{eif\\:floor(t/60)\\:d}\\:%{eif\\:mod(floor(t)\\,60)\\:d\\:2}`;
+        filters.push(`[${currentLabel}]drawtext=fontfile='${MONO_FONT}':text='${timeExpr}':fontsize=${timerInfo.fontSize || 22}:fontcolor=${ffTimerColor}@${timerOpacity}:x=${timerInfo.x || 0}:y=${timerInfo.y || 0}[withtimer]`);
+        currentLabel = 'withtimer';
+      }
+
+      filters.push(`[${currentLabel}]unsharp=5:5:0.45:3:3:0.0[out]`);
+
+      args.push('-filter_complex', filters.join(';'));
+      args.push('-map', '[out]', '-map', '1:a');
+    }
+
+    args.push(
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-tune', 'stillimage',
+      '-crf', '22',
+      '-c:a', canCopyAudio ? 'copy' : 'aac',
+    );
+    if (!canCopyAudio) args.push('-b:a', '192k');
+    args.push(
+      '-t', dur,
+      '-movflags', '+faststart',
+      '-pix_fmt', 'yuv420p',
+      '-threads', '0',
+      '-shortest',
+      outputPath,
+    );
+
+    log(`  ffmpeg podcast: compositing → ${path.basename(outputPath)} (${dur}s, crf=22, copyAudio=${canCopyAudio}, waveformBlend=${waveformBlendMode})`);
+    const proc = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // Store PID on job for cancellation
+    if (job) job._ffmpegProc = proc;
+
+    let stderr = '';
+    proc.stderr.on('data', d => {
+      const chunk = d.toString();
+      stderr += chunk;
+      if (onProgress && duration > 0) {
+        const timeMatch = chunk.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (timeMatch) {
+          const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
+          onProgress(Math.min(0.99, secs / duration));
+        }
+      }
+    });
+    proc.on('close', code => {
+      if (job) job._ffmpegProc = null;
+      if (code === 0) {
+        log(`  ffmpeg podcast: done → ${path.basename(outputPath)} (${(fs.statSync(outputPath).size / 1024 / 1024).toFixed(1)} MB)`);
+        resolve(outputPath);
+      } else {
+        log(`  ffmpeg podcast error (code ${code}):\n${stderr.slice(-800)}`);
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
+// ── Process podcast export job ──────────────────────────────────────────────
+
+let podcastRenderActive = false;
+
+async function processPodcastJob(job) {
+  const { opts } = job;
+  const { audioPath, framePng, frameLitPng, duration, width, height, progressBar, timerInfo, waveformRegion, accentColor } = opts;
+  const framePath = path.join(TEMP_DIR, `${job.id}_frame.png`);
+  const frameLitPath = frameLitPng ? path.join(TEMP_DIR, `${job.id}_frame_lit.png`) : null;
+  const outputPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
+
+  try {
+    // 1. Decode full-frame PNG data URL(s) → temp file(s)
+    job.status = 'rendering';
+    job.progress = 0.05;
+    const base64Match = framePng.match(/^data:image\/png;base64,(.+)$/);
+    if (!base64Match) throw new Error('Invalid frame PNG data URL');
+    fs.writeFileSync(framePath, Buffer.from(base64Match[1], 'base64'));
+    log(`  Podcast frame saved: ${framePath} (${(fs.statSync(framePath).size / 1024).toFixed(0)} KB)`);
+
+    if (frameLitPng && frameLitPath) {
+      const litMatch = frameLitPng.match(/^data:image\/png;base64,(.+)$/);
+      if (litMatch) {
+        fs.writeFileSync(frameLitPath, Buffer.from(litMatch[1], 'base64'));
+        log(`  Podcast frame (lit) saved: ${frameLitPath} (${(fs.statSync(frameLitPath).size / 1024).toFixed(0)} KB)`);
+      }
+    }
+
+    // 2. Composite with ffmpeg
+    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+    await compositePodcast(audioPath, framePath, outputPath, {
+      width, height, duration, progressBar, timerInfo, waveformRegion, accentColor,
+      frameLitPath: frameLitPath && fs.existsSync(frameLitPath) ? frameLitPath : null,
+      onProgress: (pct) => { job.progress = Math.max(job.progress, 0.05 + pct * 0.9); },
+      job,
+    });
+
+    job.progress = 0.97;
+
+    // 3. Done — set URL
+    const relUrl = `/assets/content-designer/videos/${job.id}.mp4`;
+    job.status = 'ready';
+    job.progress = 1;
+    job.url = relUrl;
+    log(`  Podcast job ${job.id} ready: ${relUrl} (${(fs.statSync(outputPath).size / 1024 / 1024).toFixed(1)} MB)`);
+
+    // Cleanup temp files (keep output MP4 for download)
+    fs.unlink(framePath, () => {});
+    if (frameLitPath) fs.unlink(frameLitPath, () => {});
+    fs.unlink(audioPath, () => {});
+  } catch (err) {
+    job.status = 'error';
+    job.error = err.message;
+    log(`  Podcast job ${job.id} FAILED: ${err.message}`);
+    fs.unlink(framePath, () => {});
+    if (frameLitPath) fs.unlink(frameLitPath, () => {});
+    fs.unlink(audioPath, () => {});
+    // Clean up partial output
+    fs.unlink(outputPath, () => {});
+  } finally {
+    podcastRenderActive = false;
+  }
+}
+
 // ── Housekeeping ────────────────────────────────────────────────────────────
 
 function cleanup() {
@@ -338,15 +618,64 @@ function cleanup() {
     if (totalMB > 100) log(`  Cache size: ${totalMB.toFixed(0)} MB (${files.length} files)`);
   } catch {}
 
-  // Purge old jobs from memory
+  // Purge old jobs from memory (skip jobs still rendering — they have their own lifecycle)
   for (const [id, job] of jobs) {
-    if (now - job.createdAt > MAX_OUTPUT_AGE_MS) jobs.delete(id);
+    if (job.status === 'rendering' || job.status === 'downloading' || job.status === 'compositing') continue;
+    const ttl = job.videoId === 'podcast' ? MAX_PODCAST_OUTPUT_AGE_MS : MAX_OUTPUT_AGE_MS;
+    if (now - job.createdAt > ttl) {
+      jobs.delete(id);
+    }
+  }
+
+  // Auto-cancel abandoned podcast jobs (no poll for ABANDON_TIMEOUT_MS)
+  for (const [id, job] of jobs) {
+    if (job.videoId === 'podcast' && job.status === 'rendering' && job.lastPolled) {
+      if (now - job.lastPolled > ABANDON_TIMEOUT_MS) {
+        log(`  Cleanup: auto-cancelling abandoned podcast job ${id} (no poll for ${Math.round((now - job.lastPolled) / 1000)}s)`);
+        if (job._ffmpegProc) { try { job._ffmpegProc.kill('SIGKILL'); } catch {} }
+        job.status = 'error';
+        job.error = 'Cancelled (abandoned)';
+        podcastRenderActive = false;
+        // Cleanup temp files
+        const framePath = path.join(TEMP_DIR, `${id}_frame.png`);
+        const frameLitPath = path.join(TEMP_DIR, `${id}_frame_lit.png`);
+        const outputPath = path.join(OUTPUT_DIR, `${id}.mp4`);
+        fs.unlink(framePath, () => {});
+        fs.unlink(frameLitPath, () => {});
+        fs.unlink(outputPath, () => {});
+        if (job.opts?.audioPath) fs.unlink(job.opts.audioPath, () => {});
+      }
+    }
+  }
+
+  // Purge stale podcast upload sessions (abandoned uploads)
+  for (const [sid, session] of podcastSessions) {
+    if (now - session.createdAt > MAX_TEMP_AGE_MS) {
+      fs.unlink(session.audioPath, () => {});
+      podcastSessions.delete(sid);
+      log(`  Cleanup: removed stale podcast session ${sid}`);
+    }
   }
 }
 
-// Run cleanup on startup and every 2 minutes
+// Startup cleanup: wipe stale temp files and old output MP4s
+function startupCleanup() {
+  log('Startup cleanup...');
+  try {
+    const tmpFiles = fs.readdirSync(TEMP_DIR);
+    for (const f of tmpFiles) { fs.unlinkSync(path.join(TEMP_DIR, f)); }
+    if (tmpFiles.length > 0) log(`  Removed ${tmpFiles.length} stale temp files`);
+  } catch {}
+  try {
+    const outFiles = fs.readdirSync(OUTPUT_DIR);
+    for (const f of outFiles) { fs.unlinkSync(path.join(OUTPUT_DIR, f)); }
+    if (outFiles.length > 0) log(`  Removed ${outFiles.length} stale output files`);
+  } catch {}
+}
+
+startupCleanup();
 cleanup();
-setInterval(cleanup, 2 * 60 * 1000);
+setInterval(cleanup, 60 * 1000); // every 60s
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
 
@@ -372,6 +701,7 @@ const server = http.createServer(async (req, res) => {
     const jobId = url.pathname.split('/status/')[1];
     const job = jobs.get(jobId);
     if (!job) return sendJSON(res, 404, { error: 'Job not found' });
+    job.lastPolled = Date.now();
     return sendJSON(res, 200, {
       status: job.status,
       progress: job.progress,
@@ -511,6 +841,208 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       log(`GIF export failed: ${err.message}`);
       return sendJSON(res, 500, { error: err.message });
+    }
+  }
+
+  // POST /podcast-upload-chunk — receive one chunk of audio binary (≤4 MB each)
+  // Body: raw binary. Headers: x-session-id, x-chunk-index, x-total-chunks, x-file-ext
+  if (req.method === 'POST' && url.pathname === '/podcast-upload-chunk') {
+    try {
+      const sessionId = req.headers['x-session-id'];
+      const chunkIndex = parseInt(req.headers['x-chunk-index'], 10);
+      const totalChunks = parseInt(req.headers['x-total-chunks'], 10);
+      const fileExt = (req.headers['x-file-ext'] || '.m4a').replace(/[^a-z0-9.]/gi, '');
+
+      if (!sessionId || !(/^[a-f0-9]{16}$/.test(sessionId))) {
+        return sendJSON(res, 400, { error: 'Invalid x-session-id' });
+      }
+      if (isNaN(chunkIndex) || isNaN(totalChunks) || chunkIndex < 0 || totalChunks < 1) {
+        return sendJSON(res, 400, { error: 'Invalid chunk headers' });
+      }
+
+      // Collect raw binary body (max 5 MB per chunk)
+      const chunkData = await collectRawBody(req, 5 * 1024 * 1024);
+
+      // Initialize session on first chunk
+      if (!podcastSessions.has(sessionId)) {
+        const audioPath = path.join(TEMP_DIR, `${sessionId}_audio${fileExt}`);
+        podcastSessions.set(sessionId, {
+          audioPath,
+          received: new Set(),
+          totalChunks,
+          ext: fileExt,
+          createdAt: Date.now(),
+        });
+        // Pre-allocate empty file
+        fs.writeFileSync(audioPath, Buffer.alloc(0));
+        log(`Podcast upload session ${sessionId}: started (${totalChunks} chunks, ext=${fileExt})`);
+      }
+
+      const session = podcastSessions.get(sessionId);
+
+      // Append chunk to file (frontend sends chunks sequentially)
+      fs.appendFileSync(session.audioPath, chunkData);
+      session.received.add(chunkIndex);
+
+      const complete = session.received.size >= session.totalChunks;
+      if (complete) {
+        const fileSize = fs.statSync(session.audioPath).size;
+        log(`Podcast upload session ${sessionId}: complete (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+      }
+
+      return sendJSON(res, 200, {
+        ok: true,
+        received: session.received.size,
+        totalChunks: session.totalChunks,
+        complete,
+      });
+    } catch (err) {
+      log(`Podcast chunk upload error: ${err.message}`);
+      return sendJSON(res, 400, { error: err.message });
+    }
+  }
+
+  // POST /podcast-downloaded — client confirms download started; delete after short grace period
+  if (req.method === 'POST' && url.pathname === '/podcast-downloaded') {
+    try {
+      const body = await parseBody(req);
+      const { jobId } = body;
+      if (!jobId) return sendJSON(res, 400, { error: 'Missing jobId' });
+      const job = jobs.get(jobId);
+      const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+      setTimeout(() => {
+        fs.unlink(outputPath, (err) => {
+          if (!err) log(`Podcast job ${jobId}: MP4 deleted after download grace period`);
+        });
+        if (job) jobs.delete(jobId);
+      }, PODCAST_DOWNLOADED_DELETE_DELAY_MS);
+      return sendJSON(res, 200, { ok: true, queued: true });
+    } catch (err) {
+      return sendJSON(res, 400, { error: err.message });
+    }
+  }
+
+  // POST /podcast-cancel — cancel a running podcast render
+  if (req.method === 'POST' && url.pathname === '/podcast-cancel') {
+    try {
+      const body = await parseBody(req);
+      const { jobId } = body;
+      if (!jobId) return sendJSON(res, 400, { error: 'Missing jobId' });
+      const job = jobs.get(jobId);
+      if (!job) return sendJSON(res, 404, { error: 'Job not found' });
+      if (job._ffmpegProc) {
+        try { job._ffmpegProc.kill('SIGKILL'); } catch {}
+        log(`Podcast job ${jobId}: cancelled (ffmpeg killed)`);
+      }
+      job.status = 'error';
+      job.error = 'Cancelled by user';
+      // Cleanup temp files
+      const framePath = path.join(TEMP_DIR, `${jobId}_frame.png`);
+      const frameLitPath = path.join(TEMP_DIR, `${jobId}_frame_lit.png`);
+      const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+      fs.unlink(framePath, () => {});
+      fs.unlink(frameLitPath, () => {});
+      fs.unlink(outputPath, () => {});
+      if (job.opts?.audioPath) fs.unlink(job.opts.audioPath, () => {});
+      podcastRenderActive = false;
+      return sendJSON(res, 200, { ok: true });
+    } catch (err) {
+      return sendJSON(res, 400, { error: err.message });
+    }
+  }
+
+  // POST /podcast-export — JSON body with sessionId + full-frame PNG + metadata → composited podcast MP4
+  if (req.method === 'POST' && url.pathname === '/podcast-export') {
+    try {
+      if (podcastRenderActive) {
+        return sendJSON(res, 429, { error: 'A podcast render is already in progress. Please wait.' });
+      }
+
+      const body = await parseBody(req);
+      const { sessionId, framePng, frameLitPng, duration: rawDuration, width: rawWidth, height: rawHeight, accentColor: rawAccent, progressBar: rawPb, timerInfo: rawTi, waveformRegion: rawWr } = body;
+
+      // Validate session — audio must be fully uploaded
+      if (!sessionId || !podcastSessions.has(sessionId)) {
+        return sendJSON(res, 400, { error: 'Invalid or expired sessionId. Upload audio chunks first.' });
+      }
+      const session = podcastSessions.get(sessionId);
+      if (session.received.size < session.totalChunks) {
+        return sendJSON(res, 400, { error: `Audio upload incomplete: ${session.received.size}/${session.totalChunks} chunks received.` });
+      }
+      const audioPath = session.audioPath;
+      if (!fs.existsSync(audioPath)) {
+        podcastSessions.delete(sessionId);
+        return sendJSON(res, 400, { error: 'Audio file not found. Please re-upload.' });
+      }
+
+      if (!framePng || !framePng.startsWith('data:image/png;base64,')) {
+        return sendJSON(res, 400, { error: 'Invalid framePng (must be PNG data URL)' });
+      }
+
+      const duration = Math.min(Number(rawDuration) || 900, 7200);
+      const width = Number(rawWidth) || 1920;
+      const height = Number(rawHeight) || 1080;
+      const accentColor = rawAccent || null;
+
+      let progressBar = null;
+      if (rawPb && typeof rawPb === 'object') {
+        progressBar = {
+          x: Math.round(Number(rawPb.x) || 0),
+          y: Math.round(Number(rawPb.y) || 0),
+          w: Math.round(Number(rawPb.w) || 0),
+          h: Math.round(Number(rawPb.h) || 0),
+        };
+      }
+
+      let timerInfo = null;
+      if (rawTi && typeof rawTi === 'object') {
+        timerInfo = {
+          x: Math.round(Number(rawTi.x) || 0),
+          y: Math.round(Number(rawTi.y) || 0),
+          fontSize: Math.round(Number(rawTi.fontSize) || 24),
+          color: String(rawTi.color || '#FFFFFF'),
+          opacity: Number(rawTi.opacity) || 0.5,
+        };
+      }
+
+      let waveformRegion = null;
+      if (rawWr && typeof rawWr === 'object') {
+        const x = Math.max(0, Math.min(width - 1, Math.round(Number(rawWr.x) || 0)));
+        const y = Math.max(0, Math.min(height - 1, Math.round(Number(rawWr.y) || 0)));
+        const maxW = Math.max(0, width - x);
+        const maxH = Math.max(0, height - y);
+        const w = Math.max(0, Math.min(maxW, Math.round(Number(rawWr.w) || 0)));
+        const h = Math.max(0, Math.min(maxH, Math.round(Number(rawWr.h) || 0)));
+        if (w > 0 && h > 0) {
+          waveformRegion = { x, y, w, h };
+        }
+      }
+
+      const job = createJob('podcast', {
+        audioPath,
+        framePng,
+        frameLitPng: frameLitPng || null,
+        duration,
+        width,
+        height,
+        progressBar,
+        timerInfo,
+        waveformRegion,
+        accentColor,
+      });
+      job.lastPolled = Date.now();
+
+      podcastRenderActive = true;
+      podcastSessions.delete(sessionId); // session consumed
+      log(`Podcast job ${job.id} created (${duration}s, ${width}x${height}, audio=${(fs.statSync(audioPath).size / 1024 / 1024).toFixed(1)} MB)`);
+
+      // Process async — don't await
+      processPodcastJob(job).catch(err => log(`Unhandled podcast job error: ${err.message}`));
+
+      return sendJSON(res, 202, { jobId: job.id });
+    } catch (err) {
+      log(`Podcast export request error: ${err.message}`);
+      return sendJSON(res, 400, { error: err.message });
     }
   }
 

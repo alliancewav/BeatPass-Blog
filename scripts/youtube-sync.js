@@ -25,6 +25,10 @@ const CHANNEL_HANDLE = process.env.YOUTUBE_CHANNEL_HANDLE;
 const BEATPASS_API = 'https://open.beatpass.ca/api/v1';
 const STATE_FILE = path.join(__dirname, 'youtube-sync-state.json');
 const LOG_PREFIX = () => `[${new Date().toISOString()}]`;
+const TRACK_LINK_RE = /https?:\/\/open\.beatpass\.ca\/track\/(\d+)(?:\/[^\s)\]]+)?/i;
+const BLOG_LINK_RE = /https?:\/\/blog\.beatpass\.ca\/[\S)\]]+/i;
+const PODCAST_MARKER_RE = /(?:^|\s)#(?:podcast|beatpasspodcast|bp_podcast)\b/i;
+const PODCAST_KEYWORD_RE = /\bpodcast\b|\bepisode\b|\bep\.?\s*\d+\b/i;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -61,6 +65,37 @@ function saveState(state) {
 }
 
 function log(msg) { console.log(`${LOG_PREFIX()} ${msg}`); }
+
+function createSkipError(reason) {
+  const err = new Error(reason);
+  err.code = 'SKIP_VIDEO';
+  return err;
+}
+
+function getSkipReason(desc, title) {
+  const safeDesc = desc || '';
+  const safeTitle = title || '';
+  const text = `${safeTitle}\n${safeDesc}`;
+
+  const hasTrackLink = TRACK_LINK_RE.test(safeDesc);
+  const hasBlogLink = BLOG_LINK_RE.test(safeDesc);
+  const hasPodcastMarker = PODCAST_MARKER_RE.test(text);
+  const hasPodcastKeyword = PODCAST_KEYWORD_RE.test(text);
+
+  if (hasPodcastMarker) {
+    return 'Podcast marker detected (#podcast / #beatpasspodcast)';
+  }
+  if (!hasTrackLink && hasBlogLink) {
+    return 'Blog link present but no BeatPass track link';
+  }
+  if (!hasTrackLink && hasPodcastKeyword) {
+    return 'Podcast-style title/description and no BeatPass track link';
+  }
+  if (!hasTrackLink) {
+    return 'No BeatPass track link found (open.beatpass.ca/track/...)';
+  }
+  return null;
+}
 
 // ── Ghost API ──────────────────────────────────────────────────────────────────
 
@@ -157,14 +192,14 @@ async function fetchRSSVideos() {
 
 async function getVideoDescription(videoId) {
   const html = await fetchText(`https://www.youtube.com/watch?v=${videoId}`);
-  const match = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
-  if (!match) return { desc: null, title: null };
-
-  const desc = match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-
   // Also extract video title
   const titleMatch = html.match(/"title":"((?:[^"\\]|\\.)*)"/);
   const title = titleMatch ? titleMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\') : null;
+
+  const match = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
+  if (!match) return { desc: '', title };
+
+  const desc = match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 
   return { desc, title };
 }
@@ -182,7 +217,7 @@ function parseDescription(desc, videoTitle) {
   const lines = desc.split('\n');
 
   // Track URL + ID
-  const trackUrlMatch = desc.match(/https?:\/\/open\.beatpass\.ca\/track\/(\d+)\/([^\s]+)/);
+  const trackUrlMatch = desc.match(TRACK_LINK_RE);
   const trackUrl = trackUrlMatch ? trackUrlMatch[0] : null;
   const trackId = trackUrlMatch ? parseInt(trackUrlMatch[1]) : null;
 
@@ -319,16 +354,24 @@ function buildMobiledoc(videoId, oembedHtml, articleMarkdown) {
 // ── Process a single video ─────────────────────────────────────────────────────
 
 async function processVideo(videoId, status, publishedAt = null) {
-  // 1. oEmbed
-  const oembed = await getOEmbed(videoId);
-  await delay(300);
-
-  // 2. Description + title from watch page
+  // 1. Description + title from watch page (also used for skip filtering)
   const { desc, title: pageTitle } = await getVideoDescription(videoId);
   await delay(300);
 
+  const skipReason = getSkipReason(desc, pageTitle);
+  if (skipReason) throw createSkipError(skipReason);
+
+  // 2. oEmbed
+  const oembed = await getOEmbed(videoId);
+  await delay(300);
+
+  const ytTitle = oembed?.title || pageTitle || '';
+
   // 3. Parse description
-  const parsed = parseDescription(desc, oembed?.title || pageTitle);
+  const parsed = parseDescription(desc, ytTitle);
+  if (!parsed.trackId || !parsed.trackUrl) {
+    throw createSkipError('Could not parse BeatPass track link from description');
+  }
 
   // 4. BeatPass API
   let bpTrack = null;
@@ -344,8 +387,6 @@ async function processVideo(videoId, status, publishedAt = null) {
   const producerId = bpTrack?.artists?.[0]?.id || null;
   const featureImage = bpTrack?.image || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
 
-  const ytTitle = oembed?.title || pageTitle || '';
-
   const articleData = {
     videoId,
     trackName,
@@ -356,7 +397,7 @@ async function processVideo(videoId, status, publishedAt = null) {
     producerId,
     producerInstagram: parsed.producerInstagram,
     producerYoutube: parsed.producerYoutube,
-    trackUrl: parsed.trackUrl || `https://open.beatpass.ca/track/${parsed.trackId}`,
+    trackUrl: parsed.trackUrl,
   };
 
   // 6. Build content
@@ -414,23 +455,34 @@ async function runTest() {
   const landscape = await getAllLandscapeIds();
   if (landscape.length === 0) { log('No landscape videos found.'); return; }
 
-  // Oldest = last in the array (channel page returns newest first)
-  const oldest = landscape[landscape.length - 1];
-  log(`\nProcessing oldest video: ${oldest}`);
-
   const state = loadState();
-  if (state.processed.includes(oldest)) {
-    log(`  Already processed. Skipping.`);
-    return;
+  const oldestFirst = [...landscape].reverse();
+
+  for (const videoId of oldestFirst) {
+    if (state.processed.includes(videoId)) {
+      log(`  ○ ${videoId} — already processed`);
+      continue;
+    }
+
+    log(`\nProcessing candidate video: ${videoId}`);
+    try {
+      const result = await processVideo(videoId, 'draft');
+      log(`  ✓ Created draft: "${result.title}" → slug: ${result.slug}`);
+      log(`    Track: "${result.trackName}" by ${result.producer}`);
+      state.processed.push(videoId);
+      saveState(state);
+      log('\nDone. Review the draft in Ghost Admin.');
+      return;
+    } catch (e) {
+      if (e.code === 'SKIP_VIDEO') {
+        log(`  ○ ${videoId} — skipped (${e.message})`);
+        continue;
+      }
+      throw e;
+    }
   }
 
-  const result = await processVideo(oldest, 'draft');
-  log(`  ✓ Created draft: "${result.title}" → slug: ${result.slug}`);
-  log(`    Track: "${result.trackName}" by ${result.producer}`);
-
-  state.processed.push(oldest);
-  saveState(state);
-  log('\nDone. Review the draft in Ghost Admin.');
+  log('\nNo eligible unprocessed landscape videos found.');
 }
 
 async function runBackfill() {
@@ -476,6 +528,11 @@ async function runBackfill() {
       saveState(state);
       created++;
     } catch (e) {
+      if (e.code === 'SKIP_VIDEO') {
+        log(`${num} ○ ${videoId} — skipped (${e.message})`);
+        skipped++;
+        continue;
+      }
       log(`${num} ✗ ${videoId} — ${e.message}`);
       failed++;
     }
@@ -526,6 +583,7 @@ async function runSync() {
   }
 
   let created = 0;
+  let skipped = 0;
 
   for (const entry of rssEntries) {
     if (state.processed.includes(entry.videoId) || existingVideoIds.has(entry.videoId)) continue;
@@ -540,12 +598,18 @@ async function runSync() {
       // Advance to the next day for subsequent videos
       nextScheduleDate.setDate(nextScheduleDate.getDate() + 1);
     } catch (e) {
+      if (e.code === 'SKIP_VIDEO') {
+        log(`  ○ ${entry.videoId} — skipped (${e.message})`);
+        skipped++;
+        continue;
+      }
       log(`  ✗ ${entry.videoId} — ${e.message}`);
     }
   }
 
-  if (created === 0) log('  No new videos to sync.');
-  else log(`  ${created} new video(s) scheduled.`);
+  if (created === 0 && skipped === 0) log('  No new videos to sync.');
+  else if (created === 0) log(`  No eligible new videos to sync. Skipped ${skipped} podcast/non-track video(s).`);
+  else log(`  ${created} new video(s) scheduled. Skipped ${skipped} podcast/non-track video(s).`);
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
