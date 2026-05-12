@@ -97,6 +97,44 @@ function getSkipReason(desc, title) {
   return null;
 }
 
+function tagMatches(tag, { name, slug }) {
+  return (!!name && tag?.name === name) || (!!slug && tag?.slug === slug);
+}
+
+function isVideoTag(tag) {
+  return (
+    tagMatches(tag, { name: '#video', slug: 'hash-video' }) ||
+    tagMatches(tag, { name: 'Videos', slug: 'youtube' }) ||
+    tagMatches(tag, { slug: 'videos' })
+  );
+}
+
+function isPreviewTag(tag) {
+  return tagMatches(tag, { name: '#video-preview', slug: 'hash-video-preview' });
+}
+
+function isVideoPost(post) {
+  return (post.tags || []).some(isVideoTag);
+}
+
+function isTimelineVideoPost(post) {
+  return isVideoPost(post) && !!post.published_at && ['published', 'scheduled'].includes(post.status);
+}
+
+function buildVideoTags(includePreviewTag) {
+  const tags = [
+    { name: '#video' },
+    { name: 'Videos' }
+  ];
+  if (includePreviewTag) tags.splice(1, 0, { name: '#video-preview' });
+  return tags;
+}
+
+function shouldUsePreviewTag(videoTimelineCount) {
+  // Keep preview tags on every third video in chronological order.
+  return videoTimelineCount % 3 === 0;
+}
+
 // ── Ghost API ──────────────────────────────────────────────────────────────────
 
 function createToken() {
@@ -119,6 +157,11 @@ async function ghostAPI(method, endpoint, data = null) {
     throw new Error(`Ghost ${method} ${endpoint}: ${res.status} — ${err.errors?.[0]?.message || JSON.stringify(err)}`);
   }
   return res.json();
+}
+
+async function fetchGhostVideoPosts(fields = 'id,status,published_at,updated_at,mobiledoc,html') {
+  const ghostPosts = await ghostAPI('GET', `posts/?limit=all&status=all&include=tags&fields=${fields}`);
+  return (ghostPosts.posts || []).filter(isVideoPost);
 }
 
 // ── YouTube: Scrape channel tabs ───────────────────────────────────────────────
@@ -353,7 +396,7 @@ function buildMobiledoc(videoId, oembedHtml, articleMarkdown) {
 
 // ── Process a single video ─────────────────────────────────────────────────────
 
-async function processVideo(videoId, status, publishedAt = null) {
+async function processVideo(videoId, status, publishedAt = null, includePreviewTag = true) {
   // 1. Description + title from watch page (also used for skip filtering)
   const { desc, title: pageTitle } = await getVideoDescription(videoId);
   await delay(300);
@@ -411,11 +454,7 @@ async function processVideo(videoId, status, publishedAt = null) {
       mobiledoc,
       feature_image: featureImage,
       status,
-      tags: [
-        { name: '#video' },
-        { name: '#video-preview' },
-        { name: 'Videos' }
-      ]
+      tags: buildVideoTags(includePreviewTag)
   };
   if (publishedAt) postPayload.published_at = publishedAt;
   const postData = { posts: [postPayload] };
@@ -429,7 +468,8 @@ async function processVideo(videoId, status, publishedAt = null) {
     title: result.posts[0].title,
     trackName,
     producer,
-    status
+    status,
+    hasPreviewTag: includePreviewTag
   };
 }
 
@@ -457,6 +497,14 @@ async function runTest() {
 
   const state = loadState();
   const oldestFirst = [...landscape].reverse();
+  let timelineVideoCount = 0;
+
+  try {
+    const ghostPosts = await fetchGhostVideoPosts('id,status,published_at');
+    timelineVideoCount = ghostPosts.filter(isTimelineVideoPost).length;
+  } catch (e) {
+    log(`  ⚠ Could not inspect current video cadence: ${e.message}`);
+  }
 
   for (const videoId of oldestFirst) {
     if (state.processed.includes(videoId)) {
@@ -466,8 +514,8 @@ async function runTest() {
 
     log(`\nProcessing candidate video: ${videoId}`);
     try {
-      const result = await processVideo(videoId, 'draft');
-      log(`  ✓ Created draft: "${result.title}" → slug: ${result.slug}`);
+      const result = await processVideo(videoId, 'draft', null, shouldUsePreviewTag(timelineVideoCount));
+      log(`  ✓ Created draft: "${result.title}" → slug: ${result.slug} [preview ${result.hasPreviewTag ? 'on' : 'off'}]`);
       log(`    Track: "${result.trackName}" by ${result.producer}`);
       state.processed.push(videoId);
       saveState(state);
@@ -497,9 +545,11 @@ async function runBackfill() {
 
   // Also check Ghost for existing video posts
   let existingVideoIds = new Set();
+  let timelineVideoCount = 0;
   try {
-    const ghostPosts = await ghostAPI('GET', 'posts/?filter=tag:youtube&limit=all&status=all&fields=mobiledoc,html,id');
-    for (const p of (ghostPosts.posts || [])) {
+    const ghostPosts = await fetchGhostVideoPosts('id,status,published_at,mobiledoc,html');
+    timelineVideoCount = ghostPosts.filter(isTimelineVideoPost).length;
+    for (const p of ghostPosts) {
       const content = (p.mobiledoc || '') + (p.html || '');
       for (const id of sorted) {
         if (content.includes(id)) existingVideoIds.add(id);
@@ -522,11 +572,12 @@ async function runBackfill() {
     }
 
     try {
-      const result = await processVideo(videoId, 'published');
-      log(`${num} ✓ "${result.title}" → ${result.slug}`);
+      const result = await processVideo(videoId, 'published', null, shouldUsePreviewTag(timelineVideoCount));
+      log(`${num} ✓ "${result.title}" → ${result.slug} [preview ${result.hasPreviewTag ? 'on' : 'off'}]`);
       state.processed.push(videoId);
       saveState(state);
       created++;
+      timelineVideoCount++;
     } catch (e) {
       if (e.code === 'SKIP_VIDEO') {
         log(`${num} ○ ${videoId} — skipped (${e.message})`);
@@ -551,9 +602,11 @@ async function runSync() {
   // Check Ghost for existing posts (published, scheduled, and drafts) to avoid duplicates
   let existingVideoIds = new Set();
   let latestScheduledDate = null;
+  let timelineVideoCount = 0;
   try {
-    const ghostPosts = await ghostAPI('GET', 'posts/?filter=tag:youtube&limit=all&status=all&fields=mobiledoc,html,id,status,published_at');
-    for (const p of (ghostPosts.posts || [])) {
+    const ghostPosts = await fetchGhostVideoPosts('id,status,published_at,mobiledoc,html');
+    timelineVideoCount = ghostPosts.filter(isTimelineVideoPost).length;
+    for (const p of ghostPosts) {
       const content = (p.mobiledoc || '') + (p.html || '');
       for (const e of rssEntries) {
         if (content.includes(e.videoId)) existingVideoIds.add(e.videoId);
@@ -590,11 +643,17 @@ async function runSync() {
 
     try {
       const scheduleISO = nextScheduleDate.toISOString();
-      const result = await processVideo(entry.videoId, 'scheduled', scheduleISO);
-      log(`  ✓ Scheduled: "${result.title}" → ${result.slug} (${scheduleISO})`);
+      const result = await processVideo(
+        entry.videoId,
+        'scheduled',
+        scheduleISO,
+        shouldUsePreviewTag(timelineVideoCount)
+      );
+      log(`  ✓ Scheduled: "${result.title}" → ${result.slug} (${scheduleISO}) [preview ${result.hasPreviewTag ? 'on' : 'off'}]`);
       state.processed.push(entry.videoId);
       saveState(state);
       created++;
+      timelineVideoCount++;
       // Advance to the next day for subsequent videos
       nextScheduleDate.setDate(nextScheduleDate.getDate() + 1);
     } catch (e) {

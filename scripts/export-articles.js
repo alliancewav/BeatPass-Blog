@@ -3,7 +3,7 @@
 /**
  * Ghost Article Export Script
  * Fetches all published/scheduled non-video articles from Ghost CMS
- * and exports them as markdown files to content/blog-drafts/ in the
+ * and exports them as markdown files to content/offline-articles/ in the
  * same format used by deploy-content.js.
  *
  * Usage: node scripts/export-articles.js
@@ -20,7 +20,7 @@ require('./load-env');
 const API_URL = process.env.GHOST_URL;
 const ADMIN_KEY_ID = process.env.GHOST_ADMIN_KEY_ID;
 const ADMIN_KEY_SECRET = process.env.GHOST_ADMIN_KEY_SECRET;
-const DRAFTS_DIR = path.resolve(__dirname, '../content/blog-drafts');
+const DRAFTS_DIR = path.resolve(__dirname, '../content/offline-articles');
 
 // Tags that identify video/beat articles (skip these)
 const VIDEO_TAGS = new Set(['hash-video', 'hash-video-preview']);
@@ -205,7 +205,7 @@ async function main() {
     fs.mkdirSync(DRAFTS_DIR, { recursive: true });
   }
 
-  // Collect existing slugs from files already in blog-drafts
+  // Collect existing slugs from files already in offline-articles
   const existingFiles = fs.readdirSync(DRAFTS_DIR).filter(f => f.endsWith('.md'));
   const existingSlugs = new Set();
   for (const file of existingFiles) {
@@ -213,7 +213,7 @@ async function main() {
     const slugMatch = content.match(/^Slug:\s*(.+)$/m);
     if (slugMatch) existingSlugs.add(slugMatch[1].trim());
   }
-  console.log(`  Found ${existingSlugs.size} existing article slugs in blog-drafts/\n`);
+  console.log(`  Found ${existingSlugs.size} existing article slugs in offline-articles/\n`);
 
   // Fetch all published + scheduled posts
   const published = await api('GET', 'posts/?limit=all&status=published&include=tags&formats=mobiledoc,html');
@@ -239,7 +239,7 @@ async function main() {
       continue;
     }
 
-    // Skip if already in blog-drafts
+    // Skip if already in offline-articles
     if (existingSlugs.has(post.slug)) {
       console.log(`  ○ [exists] Already in drafts: "${post.title}"`);
       alreadyExists++;

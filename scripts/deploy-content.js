@@ -22,7 +22,7 @@ require('./load-env');
 const API_URL = process.env.GHOST_URL;
 const ADMIN_KEY_ID = process.env.GHOST_ADMIN_KEY_ID;
 const ADMIN_KEY_SECRET = process.env.GHOST_ADMIN_KEY_SECRET;
-const DRAFTS_DIR = path.resolve(__dirname, '../content/blog-drafts');
+const DRAFTS_DIR = path.resolve(__dirname, '../content/offline-articles');
 
 // ── JWT Token ──────────────────────────────────────────────────────────────────
 
