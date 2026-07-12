@@ -240,11 +240,17 @@ async function getVideoDescription(videoId) {
   const title = titleMatch ? titleMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\') : null;
 
   const match = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
-  if (!match) return { desc: '', title };
+  const uploadDateMatch = html.match(/<meta itemprop="uploadDate" content="([^"<]+)"/i);
+  const uploadDate = uploadDateMatch ? uploadDateMatch[1] : null;
+  const durationSeconds = Number(html.match(/"lengthSeconds":"(\d+)"/)?.[1]);
+  const youtubeDuration = Number.isFinite(durationSeconds)
+    ? `PT${Math.floor(durationSeconds / 3600) ? `${Math.floor(durationSeconds / 3600)}H` : ''}${Math.floor((durationSeconds % 3600) / 60) ? `${Math.floor((durationSeconds % 3600) / 60)}M` : ''}${durationSeconds % 60}S`
+    : null;
+  if (!match) return { desc: '', title, uploadDate, youtubeDuration };
 
   const desc = match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 
-  return { desc, title };
+  return { desc, title, uploadDate, youtubeDuration };
 }
 
 // ── YouTube: oEmbed ────────────────────────────────────────────────────────────
@@ -362,6 +368,13 @@ function buildArticleMarkdown(data) {
   let md = `## ${trackName}\n\n${intro}\n\n`;
   md += `### Stream on BeatPass\n\n`;
   md += `[Listen to "${trackName}" on BeatPass](${trackUrl})\n\n`;
+  md += `## License this beat cleanly\n\n`;
+  md += `On BeatPass, eligible downloads include [standardized license terms](https://docs.beatpass.ca/help/legal/license-terms/non-exclusive) and access to [license proof](https://docs.beatpass.ca/help/downloads-and-licensing/license-certificates) inside your library.\n\n`;
+  md += `If you are releasing a song, keep your license certificate with the project so you can show proof later if a distributor, platform, collaborator, or rights team asks.\n\n`;
+  md += `Useful guides:\n\n`;
+  md += `- [How BeatPass licenses work](https://docs.beatpass.ca/help/legal/license-terms/non-exclusive)\n`;
+  md += `- [How to verify BeatPass licenses](https://blog.beatpass.ca/how-to-verify-beat-licenses/)\n`;
+  md += `- [Beat licensing explained](https://blog.beatpass.ca/beat-licensing-explained/)\n\n`;
   md += `### About the Producer\n\n`;
   md += `**${producer}** is a featured producer on BeatPass.\n\n`;
 
@@ -375,6 +388,20 @@ function buildArticleMarkdown(data) {
   md += `*Interested in exclusive rights or a custom beat? [Get in touch](https://www.instagram.com/beatpass.wav/).*`;
 
   return md;
+}
+
+function buildVideoSchema(data, title, featureImage, uploadDate, youtubeDuration) {
+  const schema = {
+    '@context': 'https://schema.org', '@type': 'VideoObject', name: title,
+    description: `Watch ${title} and listen on BeatPass.`,
+    thumbnailUrl: [featureImage || `https://i.ytimg.com/vi/${data.videoId}/maxresdefault.jpg`],
+    uploadDate: uploadDate || new Date().toISOString(),
+    embedUrl: `https://www.youtube.com/embed/${data.videoId}`,
+    url: `https://www.youtube.com/watch?v=${data.videoId}`,
+    ...(youtubeDuration ? { duration: youtubeDuration } : {}),
+    relatedLink: data.trackUrl
+  };
+  return `<!-- beatpass-video-schema:start -->\n<script type="application/ld+json">${JSON.stringify(schema)}</script>\n<!-- beatpass-video-schema:end -->`;
 }
 
 function buildMobiledoc(videoId, oembedHtml, articleMarkdown) {
@@ -398,7 +425,7 @@ function buildMobiledoc(videoId, oembedHtml, articleMarkdown) {
 
 async function processVideo(videoId, status, publishedAt = null, includePreviewTag = true) {
   // 1. Description + title from watch page (also used for skip filtering)
-  const { desc, title: pageTitle } = await getVideoDescription(videoId);
+  const { desc, title: pageTitle, uploadDate, youtubeDuration } = await getVideoDescription(videoId);
   await delay(300);
 
   const skipReason = getSkipReason(desc, pageTitle);
@@ -453,6 +480,7 @@ async function processVideo(videoId, status, publishedAt = null, includePreviewT
       title: naturalTitle,
       mobiledoc,
       feature_image: featureImage,
+      codeinjection_head: buildVideoSchema(articleData, naturalTitle, featureImage, uploadDate || publishedAt, youtubeDuration),
       status,
       tags: buildVideoTags(includePreviewTag)
   };
